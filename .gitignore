@@ -1,0 +1,14 @@
+*.log
+*.tmp
+portal-page.html
+test-output/
+*.exe
+*.pdb
+*.zip
+settings.xml
+settings.*.tmp
+status.txt
+log.txt
+log.previous.txt
+browser-session*/
+/VERIFICATION.md
