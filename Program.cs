@@ -12,7 +12,7 @@ namespace HtuAutoLogin
     internal static class Program
     {
         [STAThread]
-        private static int Main(string[] args)
+        internal static int Main(string[] args)
         {
             if (args.Length == 1 && args[0] == "--install-startup")
             {
@@ -36,6 +36,13 @@ namespace HtuAutoLogin
                 }
                 catch (Exception ex) { Storage.Log("单次运行失败：" + ex.GetType().Name); return 1; }
             }
+            return RunSettingsWindow(args);
+        }
+
+        // Keep WinForms out of the background entry point's JIT and assembly-loading path.
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private static int RunSettingsWindow(string[] args)
+        {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             if (args.Length != 0)

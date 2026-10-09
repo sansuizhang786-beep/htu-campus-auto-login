@@ -69,7 +69,12 @@ if (button.disabled || user.disabled || pass.disabled) return {kind:'waiting', o
 
         public static string ProbeScript()
         {
-            return "(() => {" + Guard + "return {kind:'ready',origin:location.origin};})()";
+            return "(() => {const result = (() => {" + Guard + @"
+return {kind:'ready',origin:location.origin};})();
+result.loaded = document.readyState === 'complete';
+result.formPresent = !!document.querySelector('input[name=""userName""], input[name=""password""], #checkButton');
+return result;
+})()";
         }
 
         public static string SubmitScript(Settings settings)
@@ -173,20 +178,28 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
                     try { locked = mutex.WaitOne(0); } catch (AbandonedMutexException) { locked = true; }
                     if (!locked) return new LoginResult(LoginState.Waiting, "已有一次登录检查正在进行。");
                     CheckStop(stop);
+                    var elapsed = Stopwatch.StartNew();
                     var network = CampusNetwork.Read();
+                    Storage.Log("阶段耗时：网络识别 " + elapsed.ElapsedMilliseconds + " 毫秒。");
                     if (network.IsOtherWifi)
                         return new LoginResult(LoginState.Waiting, "当前连接的是其他 Wi-Fi（可能是手机热点），等待连接校园网；不会将热点联网视为校园网认证成功。");
                     if (!System.Net.NetworkInformation.NetworkInterface.GetIsNetworkAvailable())
                         return new LoginResult(LoginState.Waiting, "等待网络连接，请先连接 HTU / HTU_5G 或校园网网线。");
 
                     bool sawGateway = false;
-                    foreach (string entry in PortalAutomation.EntryUrls(settings.PortalUrl))
+                    string[] entries = PortalAutomation.EntryUrls(settings.PortalUrl);
+                    var browserStart = Stopwatch.StartNew();
+                    // Begin gateway loading while Edge initializes its profile and private control connection.
+                    using (var browser = new PortalBrowser(entries[0]))
                     {
-                      CheckStop(stop);
-                      using (var browser = new PortalBrowser())
+                      Storage.Log("阶段耗时：临时浏览器启动 " + browserStart.ElapsedMilliseconds + " 毫秒。");
+                      for (int entryIndex = 0; entryIndex < entries.Length; entryIndex++)
                       {
+                        string entry = entries[entryIndex];
                         CheckStop(stop);
-                        try { browser.Navigate(entry); }
+                        var entryStart = Stopwatch.StartNew();
+                        // The first entry is already loading; do not reload it and discard redirect parameters.
+                        try { if (entryIndex != 0) browser.Navigate(entry); }
                         catch (Exception ex)
                         {
                             if (!(ex is OperationCanceledException) && !(ex is InvalidOperationException) && !(ex is WebSocketException)) throw;
@@ -196,6 +209,8 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
                         }
                         Dictionary<string, object> probe = null;
                         var timer = Stopwatch.StartNew();
+                        Stopwatch settled = null;
+                        bool quickInternetChecked = false;
                         while (timer.Elapsed.TotalSeconds < 10)
                         {
                             CheckStop(stop);
@@ -205,6 +220,33 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
                             if (GetString(probe, "origin") == "http://1.1.1.1") sawGateway = true;
                             if (kind == "ready") break;
                             if (kind == "captcha") return new LoginResult(LoginState.UnsupportedPortal, "登录页需要验证码，请在浏览器中手动登录。");
+                            bool gatewayWithoutForm = IsSettledGatewayWithoutForm(probe);
+                            bool publicPage = IsLoadedPublicPage(probe);
+                            if (gatewayWithoutForm || publicPage)
+                            {
+                                if (settled == null) settled = Stopwatch.StartNew();
+                                if (settled.ElapsedMilliseconds >= 1000)
+                                {
+                                    if (publicPage) break;
+                                    if (!quickInternetChecked && network.HasCampusCandidate)
+                                    {
+                                        quickInternetChecked = true;
+                                        if (TestInternet(1000))
+                                        {
+                                            CheckStop(stop);
+                                            var freshProbe = browser.Evaluate(PortalAutomation.ProbeScript());
+                                            var freshNetwork = CampusNetwork.Read();
+                                            if (IsSettledGatewayWithoutForm(freshProbe) &&
+                                                CanSkipLogin(freshNetwork.HasCampusCandidate, sawGateway, false, true))
+                                            {
+                                                Storage.Log("阶段耗时：已联网快速检查完成，检查总计 " + elapsed.ElapsedMilliseconds + " 毫秒。");
+                                                return new LoginResult(LoginState.Online, "当前连接校园网络，网关页面无认证表单，且普通 HTTPS 网站可访问；本次无需提交登录。");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else settled = null;
                             // about:blank / chrome-error are transient navigation states, never credential targets.
                             // Public entry pages may take a moment to redirect. They never receive credentials.
                             Thread.Sleep(200);
@@ -216,6 +258,7 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
                         }
 
                         // A transport failure after this point can still mean the server received a login.
+                        Storage.Log("阶段耗时：控制连接就绪后等待表单 " + entryStart.ElapsedMilliseconds + " 毫秒；检查开始到表单就绪 " + elapsed.ElapsedMilliseconds + " 毫秒。");
                         CheckStop(stop);
                         if (CampusNetwork.Read().IsOtherWifi)
                             return new LoginResult(LoginState.Waiting, "认证前网络已切换，等待重新连接校园网；未填写账号密码。");
@@ -288,8 +331,26 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
         }
 
         public static bool TestInternet()
+        { return TestInternet(3500); }
+
+        private static bool TestInternet(int timeout)
         {
-            return CheckProbe("https://www.qq.com/") || CheckProbe("https://www.baidu.com/");
+            return CheckProbe("https://www.qq.com/", timeout) || CheckProbe("https://www.baidu.com/", timeout);
+        }
+
+        internal static bool IsSettledGatewayWithoutForm(Dictionary<string, object> probe)
+        {
+            return GetString(probe, "origin") == "http://1.1.1.1" && GetString(probe, "kind") == "waiting" &&
+                probe.ContainsKey("loaded") && Object.Equals(probe["loaded"], true) &&
+                probe.ContainsKey("formPresent") && Object.Equals(probe["formPresent"], false);
+        }
+
+        internal static bool IsLoadedPublicPage(Dictionary<string, object> probe)
+        {
+            Uri origin;
+            return GetString(probe, "kind") == "untrusted" && probe.ContainsKey("loaded") && Object.Equals(probe["loaded"], true) &&
+                Uri.TryCreate(GetString(probe, "origin"), UriKind.Absolute, out origin) &&
+                (origin.Scheme == "http" || origin.Scheme == "https") && !PortalAutomation.IsTrustedUrl(origin.AbsoluteUri);
         }
 
         internal static bool CanSkipLogin(bool campusNetwork, bool gatewaySeen, bool loginFormSeen, bool httpsReachable)
@@ -320,15 +381,15 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
             return false;
         }
 
-        private static bool CheckProbe(string url)
+        private static bool CheckProbe(string url, int timeout)
         {
             try
             {
                 var request = (HttpWebRequest)WebRequest.Create(url);
                 request.Proxy = null;
                 request.AllowAutoRedirect = false;
-                request.Timeout = 3500;
-                request.ReadWriteTimeout = 3500;
+                request.Timeout = timeout;
+                request.ReadWriteTimeout = timeout;
                 request.UserAgent = "HTUAutoLogin/1.0";
                 request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore);
                 using (var response = (HttpWebResponse)request.GetResponse())
@@ -365,8 +426,11 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
         private string profile;
         private int sequence;
 
-        internal PortalBrowser()
+        internal PortalBrowser() : this("about:blank") { }
+
+        internal PortalBrowser(string initialUrl)
         {
+            string initialArgument = InitialNavigationArgument(initialUrl);
             string edge = FindEdge();
             if (edge == null) throw new BrowserUnavailableException();
             profile = Path.Combine(Storage.DataDirectory, "browser-session-" + Guid.NewGuid().ToString("N"));
@@ -377,7 +441,7 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
                 process = Process.Start(new ProcessStartInfo(edge,
                     "--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-extensions " +
                     "--disable-background-networking --disable-sync --no-proxy-server --remote-debugging-port=0 " +
-                    "--remote-debugging-address=127.0.0.1 --user-data-dir=\"" + profile + "\" about:blank")
+                    "--remote-debugging-address=127.0.0.1 --user-data-dir=\"" + profile + "\" " + initialArgument)
                     { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden });
                 job.Assign(process);
                 string portFile = Path.Combine(profile, "DevToolsActivePort");
@@ -432,6 +496,17 @@ return {rejected: changed && /密码错误|密码不正确|用户名或密码|�
                 Command("Page.enable", new { });
             }
             catch { Dispose(); throw; }
+        }
+
+        private static string InitialNavigationArgument(string value)
+        {
+            if (value == "about:blank") return "about:blank";
+            Uri uri;
+            if (!Uri.TryCreate(value, UriKind.Absolute, out uri) || !String.IsNullOrEmpty(uri.UserInfo) ||
+                !(PortalAutomation.IsTrustedUrl(value) || (uri.IsLoopback && uri.Scheme == "http")))
+                throw new ArgumentException("临时浏览器起始页必须为已支持的认证入口。");
+            // Canonical URI escaping prevents the starting URL from introducing command-line switches.
+            return "\"" + uri.AbsoluteUri + "\"";
         }
 
         private static ClientWebSocket ConnectSocket(string endpoint, string port)

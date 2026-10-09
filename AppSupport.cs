@@ -154,21 +154,7 @@ namespace HtuAutoLogin
         {
             get
             {
-                if (!File.Exists(ShortcutPath)) return false;
-                try
-                {
-                    var doc = new XmlDocument();
-                    doc.XmlResolver = null;
-                    doc.LoadXml(ReadTaskXml(ResumeTaskName));
-                    var ns = new XmlNamespaceManager(doc.NameTable);
-                    ns.AddNamespace("t", TaskNamespace);
-                    XmlNode enabled = doc.SelectSingleNode("/t:Task/t:Settings/t:Enabled", ns);
-                    XmlNode trigger = doc.SelectSingleNode("/t:Task/t:Triggers/t:EventTrigger", ns);
-                    XmlNode triggerEnabled = trigger == null ? null : trigger.SelectSingleNode("t:Enabled", ns);
-                    // Windows omits default-valued true flags when returning the registered XML.
-                    return trigger != null && (enabled == null || enabled.InnerText == "true") &&
-                        (triggerEnabled == null || triggerEnabled.InnerText == "true");
-                }
+                try { return IsTaskEnabledXml(ReadTaskXml(ResumeTaskName)); }
                 catch { return false; }
             }
         }
@@ -177,29 +163,9 @@ namespace HtuAutoLogin
         {
             string executable = Assembly.GetExecutingAssembly().Location;
             RegisterTask(ResumeTaskName, BuildResumeTaskXml(executable, "--background", LoginEngine.UserSuffix));
-            Directory.CreateDirectory(Path.GetDirectoryName(ShortcutPath));
-            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
-            if (shellType == null) throw new InvalidOperationException("Windows 快捷方式组件不可用，未能设置开机自启动。");
-            object shell = null;
-            object shortcut = null;
-            try
-            {
-                shell = Activator.CreateInstance(shellType);
-                shortcut = shellType.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell,
-                    new object[] { ShortcutPath });
-                Set(shortcut, "TargetPath", executable);
-                Set(shortcut, "Arguments", "--background");
-                Set(shortcut, "WorkingDirectory", Path.GetDirectoryName(executable));
-                Set(shortcut, "WindowStyle", 7);
-                Set(shortcut, "Description", "河南师范大学校园网自动登录（登录 Windows 或睡眠恢复后运行）");
-                Set(shortcut, "IconLocation", executable + ",0");
-                shortcut.GetType().InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
-            }
-            finally
-            {
-                if (shortcut != null && Marshal.IsComObject(shortcut)) Marshal.FinalReleaseComObject(shortcut);
-                if (shell != null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
-            }
+            if (!IsEnabled) throw new InvalidOperationException("登录/恢复触发未完整启用，保留原有启动入口，请稍后重试。");
+            // Migrate only after confirming the unified task. Explorer's delayed shortcut caused a second run.
+            if (File.Exists(ShortcutPath)) File.Delete(ShortcutPath);
         }
 
         public static void Disable()
@@ -216,9 +182,13 @@ namespace HtuAutoLogin
                 writer.WriteStartElement("Task", TaskNamespace);
                 writer.WriteAttributeString("version", "1.2");
                 writer.WriteStartElement("RegistrationInfo");
-                writer.WriteElementString("Description", "河南师范大学校园网自动登录：当前用户睡眠/休眠恢复后运行，确认联网后退出。");
+                writer.WriteElementString("Description", "河南师范大学校园网自动登录：当前用户登录或睡眠/休眠恢复后运行，确认联网后退出。");
                 writer.WriteEndElement();
                 writer.WriteStartElement("Triggers");
+                writer.WriteStartElement("LogonTrigger");
+                writer.WriteElementString("Enabled", "true");
+                writer.WriteElementString("UserId", sid);
+                writer.WriteEndElement();
                 writer.WriteStartElement("EventTrigger");
                 writer.WriteElementString("Enabled", "true");
                 writer.WriteElementString("Subscription", "<QueryList><Query Id=\"0\" Path=\"System\"><Select Path=\"System\">*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]</Select></Query></QueryList>");
@@ -254,6 +224,26 @@ namespace HtuAutoLogin
                 writer.WriteEndElement();
             }
             return output.ToString();
+        }
+
+        internal static bool IsTaskEnabledXml(string xml)
+        {
+            var doc = new XmlDocument();
+            doc.XmlResolver = null;
+            doc.LoadXml(xml);
+            var ns = new XmlNamespaceManager(doc.NameTable);
+            ns.AddNamespace("t", TaskNamespace);
+            XmlNode enabled = doc.SelectSingleNode("/t:Task/t:Settings/t:Enabled", ns);
+            if (enabled != null && enabled.InnerText != "true") return false;
+            foreach (string kind in new[] { "LogonTrigger", "EventTrigger" })
+            {
+                XmlNode trigger = doc.SelectSingleNode("/t:Task/t:Triggers/t:" + kind, ns);
+                if (trigger == null) return false;
+                XmlNode flag = trigger.SelectSingleNode("t:Enabled", ns);
+                // Windows omits default-valued true flags in registered XML.
+                if (flag != null && flag.InnerText != "true") return false;
+            }
+            return true;
         }
 
         // Task Scheduler uses the current interactive user token; no Windows password is stored.
@@ -334,9 +324,5 @@ namespace HtuAutoLogin
             if (value != null && Marshal.IsComObject(value)) Marshal.FinalReleaseComObject(value);
         }
 
-        private static void Set(object target, string name, object value)
-        {
-            target.GetType().InvokeMember(name, BindingFlags.SetProperty, null, target, new object[] { value });
-        }
     }
 }
